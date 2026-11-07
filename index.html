@@ -117,6 +117,8 @@ button:focus-visible { outline: 2px solid var(--lime); outline-offset: 3px; }
   gap: 5px 9px; flex-wrap: wrap; color: #d2e4cf; font-size: 12px; line-height: 1.45;
 }
 .feedback strong { color: var(--lime); }
+.yaku-labels { display: block; color: #e5f2cd; }
+.score-total { display: block; margin-top: 3px; }
 .feedback .short { color: var(--amber); }
 .feedback button, .utility button {
   border: 0; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; padding: 4px 0;
@@ -1252,7 +1254,10 @@ const Art = (() => {
     if (score) {
       const gap = ready ? '<strong>已达标</strong>' :
         '<span class="short">还差 ' + format(game.goal - score.payout.total) + ' 分</span>';
-      return FORMS[score.form] + ' · ' + score.fu + ' 符 ' + score.han + ' 翻 · ' + gap;
+      const roles = score.details.filter(row => row.category === 'yaku' || row.category === 'yakuman' ||
+        (row.category === 'relic' && row.name.endsWith('升级')));
+      return '<span class="yaku-labels">' + roles.map(row => row.name + ' +' + row.han + ' 翻').join(' · ') +
+        '</span><span class="score-total">' + score.fu + ' 符 · 合计 ' + score.han + ' 翻 · ' + gap + '</span>';
     }
     if (!count) return '点候选牌加入，选满 ' + HAND_SIZE + ' 张自动算分。';
     if (count === HAND_SIZE) return '尚未和牌' + (distance > 0 ? ' · ' + distance + ' 向听' : '') + '。点已选牌退回。';
