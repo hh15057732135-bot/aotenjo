@@ -189,6 +189,15 @@ dialog.fallback[open] { position: fixed; inset: 0; z-index: 6; height: fit-conte
   border: 1px solid #577150; border-radius: 7px; font: 16px var(--sans);
 }
 .upgrade-product { margin-top: 5px; }
+.deck-grid { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 4px; }
+.deck-card { display: grid; justify-items: center; gap: 2px; min-width: 0; min-height: 44px; padding: 3px;
+  border: 1px solid var(--line); border-radius: 5px; background: #243427; }
+.removal-picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.deck-card:disabled { opacity: .65; }
+.deck-card[aria-pressed="true"] { border-color: var(--lime); background: #3e5438; }
+.deck-card .tile { width: min(100%, 29px); --tile-edge: 2px; }
+.deck-card > span:last-child { color: var(--muted); font: 10px var(--mono); }
+@media (max-width: 420px) { .deck-grid { grid-template-columns: repeat(7, minmax(0, 1fr)); } }
 .build-row { border-bottom: 1px solid #3b503d; padding: 6px 0; }
 .toast {
   position: fixed; z-index: 5; left: 50%; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); translate: -50% 0;
@@ -612,6 +621,8 @@ const Solo = (() => {
   ];
   const itemById = new Map(items.map(item => [item.id, item]));
   const REFRESH_PRICE = 2;
+  const REMOVE_PRICE = 3;
+  const REMOVE_LIMIT = 3;
   const recipes = ['sequences', 'value', 'colors', 'straight', 'flush', 'pairs', 'triples', 'outside'];
   const relicById = new Map(RELICS.map(relic => [relic.id, relic]));
   const deck = Array.from({ length: 136 }, (_, i) => i);
@@ -741,8 +752,40 @@ const Solo = (() => {
     return [...kinds, head, head];
   }
 
-  function buildPool(kinds, recipe, random) {
-    const wall = shuffle(deck, random);
+  function availableShape(cards) {
+    const counts = M.counts(cards);
+    const pairs = M.KINDS.filter(k => counts[k] >= 2);
+    if (pairs.length >= 7) return pairs.slice(0, 7).flatMap(k => [k, k]);
+    if (outsideKinds.every(k => counts[k])) {
+      const head = outsideKinds.find(k => counts[k] >= 2);
+      if (head !== undefined) return [...outsideKinds, head];
+    }
+    const groups = [...sequences.filter(set => set.every(k => counts[k])),
+      ...triplets.filter(set => counts[set[0]] >= 3)];
+    const chosen = [];
+    function fill(start) {
+      if (chosen.length === 12) return true;
+      for (let i = start; i < groups.length; i++) {
+        const group = groups[i];
+        if (group[0] === group[1] ? counts[group[0]] < 3 : group.some(k => !counts[k])) continue;
+        for (const k of group) counts[k]--;
+        chosen.push(...group);
+        if (fill(i)) return true;
+        chosen.length -= 3;
+        for (const k of group) counts[k]++;
+      }
+      return false;
+    }
+    for (const head of pairs) {
+      counts[head] -= 2;
+      if (fill(0)) return [...chosen, head, head];
+      counts[head] += 2;
+    }
+    return null;
+  }
+
+  function buildPool(kinds, recipe, cards, random) {
+    const wall = shuffle(cards, random);
     const pull = predicate => wall.splice(wall.findIndex(predicate), 1)[0];
     const takeKind = (k, red) => pull(tile => M.kind(tile) === k && (red === undefined || M.isRed(tile) === red));
     const guide = recipe === 'guide';
@@ -767,17 +810,20 @@ const Solo = (() => {
     return { recipe, solution, pool: pool.sort(M.byTile), indicator, wall, bonusHan: 0 };
   }
 
-  function generate({ floor, goal, build, previous, guide, random }) {
-    const tutorial = () => buildPool([1, 2, 3, 12, 13, 14, 19, 20, 21, 22, 22, 23, 24, 25], 'guide', random);
+  function generate({ floor, goal, build, previous, guide, cards, random }) {
+    const tutorial = () => buildPool([1, 2, 3, 12, 13, 14, 19, 20, 21, 22, 22, 23, 24, 25], 'guide', cards, random);
     if (guide) return tutorial();
     const choices = (floor >= 12 ? [...recipes, 'orphans'] : recipes).filter(name => name !== previous);
+    const available = M.counts(cards);
     let nearest = null;
     let fallback = null;
     for (let attempt = 0; attempt < 26; attempt++) {
       const recipe = randomFrom(choices, random);
       const kinds = designHand(recipe, random);
       if (!kinds) continue;
-      const puzzle = buildPool(kinds, recipe, random);
+      const needed = Array(34).fill(0);
+      if (kinds.some(k => ++needed[k] > available[k])) continue;
+      const puzzle = buildPool(kinds, recipe, cards, random);
       const score = bestScore(puzzle.solution, puzzle.indicator, build);
       if (!score) continue;
       const points = score.payout.total;
@@ -787,7 +833,7 @@ const Solo = (() => {
       } else if (!fallback || points > fallback.points) fallback = { puzzle, score, points };
     }
     if (nearest) return nearest.puzzle;
-    const puzzle = fallback?.puzzle ?? tutorial();
+    const puzzle = fallback?.puzzle ?? buildPool(availableShape(cards), 'deck', cards, random);
     const score = fallback?.score ?? bestScore(puzzle.solution, puzzle.indicator, build);
     while (M.payments(score.fu, score.han + puzzle.bonusHan * score.multiplier, false, true).total < goal) puzzle.bonusHan++;
     return puzzle;
@@ -795,16 +841,17 @@ const Solo = (() => {
 
   function newRun() {
     return { version: 2, floor: 1, goal: '8000', highest: '0', cleared: 0,
-      hearts: MAX_HEARTS, relics: [], items: [], levels: {}, coins: 0, shop: null, view: 'play', puzzle: null };
+      hearts: MAX_HEARTS, relics: [], items: [], levels: {}, removed: [], coins: 0, shop: null, view: 'play', puzzle: null };
   }
 
   class Game {
     constructor(snapshot = null, random = Math.random) {
       this.s = snapshot ?? newRun();
       this.random = random;
+      this.s.removed ??= [];
       if (!snapshot) this.deal(true);
       else if (snapshot.version === 1) {
-        Object.assign(this.s, { version: 2, items: [], levels: {}, coins: 0, shop: null });
+        Object.assign(this.s, { version: 2, items: [], levels: {}, removed: [], coins: 0, shop: null });
         delete this.s.rewards;
         if (snapshot.view === 'reward') this.openShop(this.getScore());
       }
@@ -814,6 +861,27 @@ const Solo = (() => {
     get playing() { return this.s.view === 'play'; }
     get goal() { return BigInt(this.s.goal); }
     get relics() { return this.s.relics.map(id => relicById.get(id)); }
+    get cards() { return deck.filter(tile => !this.s.removed.includes(tile)); }
+
+    get removalsLeft() { return REMOVE_LIMIT - (this.s.shop?.removedCount ?? 0); }
+
+    canRemove(tiles) {
+      if (this.s.view !== 'shop' || !tiles.length || tiles.length > this.removalsLeft ||
+          this.s.coins < tiles.length * REMOVE_PRICE) return false;
+      const cards = this.cards;
+      if (new Set(tiles).size !== tiles.length || !tiles.every(tile => cards.includes(tile))) return false;
+      const remaining = cards.filter(id => !tiles.includes(id));
+      return remaining.length >= POOL_SIZE + MAX_DRAWS + 1 && Boolean(availableShape(remaining));
+    }
+
+    removeTiles(tiles) {
+      if (!this.canRemove(tiles)) return false;
+      this.s.coins -= tiles.length * REMOVE_PRICE;
+      this.s.shop.removedCount = (this.s.shop.removedCount ?? 0) + tiles.length;
+      this.s.removed.push(...tiles);
+      return true;
+    }
+
     get build() { return { relics: this.relics, items: this.s.items, levels: this.s.levels }; }
     get maxDraws() {
       return Math.min(MAX_DRAWS, BASE_DRAWS + [...this.s.relics, ...this.s.items].filter(id => id === 'supply').length);
@@ -822,7 +890,7 @@ const Solo = (() => {
     deal(guide = false) {
       this.s.puzzle = {
         ...generate({ floor: this.s.floor, goal: this.goal, build: this.build,
-          previous: this.puzzle?.recipe, guide, random: this.random }),
+          previous: this.puzzle?.recipe, guide, cards: this.cards, random: this.random }),
         selected: [], drawn: [], drawsLeft: this.maxDraws
       };
       this.s.view = 'play';
@@ -924,7 +992,7 @@ const Solo = (() => {
       const earned = 5 + Number(points >= this.goal * 2n) + Number(points >= this.goal * 3n);
       this.s.coins += earned;
       this.s.shop = { earned, score: { points: points.toString(), fu: score.fu, han: score.han, form: score.form },
-        stock: this.stock(), refreshed: false };
+        stock: this.stock(), refreshed: false, removedCount: 0 };
       this.s.view = 'shop';
     }
 
@@ -977,7 +1045,7 @@ const Solo = (() => {
     }
   }
 
-  return { Game, POOL_SIZE, HAND_SIZE, MAX_HEARTS, FORMS, relicById, itemById, upgrades, upgradeById, REFRESH_PRICE };
+  return { Game, POOL_SIZE, HAND_SIZE, MAX_HEARTS, FORMS, relicById, itemById, upgrades, upgradeById, REFRESH_PRICE, REMOVE_PRICE };
 })();
 
 </script>
@@ -1103,7 +1171,7 @@ const Art = (() => {
   <script>
 (() => {
   const M = Mahjong;
-  const { Game, HAND_SIZE, POOL_SIZE, MAX_HEARTS, FORMS, relicById, itemById, upgrades, upgradeById, REFRESH_PRICE } = Solo;
+  const { Game, HAND_SIZE, POOL_SIZE, MAX_HEARTS, FORMS, relicById, itemById, upgrades, upgradeById, REFRESH_PRICE, REMOVE_PRICE } = Solo;
   const { icon, tile } = Art;
   const $ = id => document.getElementById(id);
   const saveKey = 'aotenjo.solo.v1';
@@ -1127,6 +1195,8 @@ const Art = (() => {
           Array.isArray(s.puzzle?.solution) && Array.isArray(s.puzzle?.wall) &&
           Array.isArray(s.relics) && s.relics.every(id => relicById.has(id)) &&
           (s.version === 1 || (Array.isArray(s.items) && s.items.every(id => itemById.has(id)) &&
+            (s.removed === undefined || (Array.isArray(s.removed) && new Set(s.removed).size === s.removed.length &&
+              s.removed.every(id => Number.isInteger(id) && id >= 0 && id < 136))) &&
             Number.isSafeInteger(s.coins) && s.coins >= 0 && s.levels &&
             Object.entries(s.levels).every(([id, level]) => upgradeById.has(id) && Number.isSafeInteger(level) && level > 0) &&
             (s.view !== 'shop' || (Array.isArray(s.shop?.stock) && s.shop.stock.every(id => itemById.has(id)) &&
@@ -1141,6 +1211,7 @@ const Art = (() => {
   let hint = null;
   let shopTab = 'items';
   let upgradeId = 'standard';
+  let removeIds = [];
   let toastTimer;
 
   function save() {
@@ -1230,7 +1301,7 @@ const Art = (() => {
       button('和牌过关', 'submit', { glyph: 'arrow', type: 'primary', disabled: !assessment.ready || !game.playing });
     $('utility').innerHTML = '<button type="button" data-action="redeal"' + (game.playing ? '' : ' disabled') +
       '>' + icon('restart') + '重发本关 · 1 命</button>' +
-      (game.s.items.length || game.s.relics.length || Object.keys(game.s.levels).length ?
+      (game.s.items.length || game.s.relics.length || game.s.removed.length || Object.keys(game.s.levels).length ?
         '<button type="button" data-action="build">' + icon('box') + '构筑</button>' : '');
   }
 
@@ -1252,7 +1323,7 @@ const Art = (() => {
   function shopHTML() {
     const { shop, coins, levels, floor } = game.s;
     const result = { ...shop.score, payout: { total: shop.score.points } };
-    const tabs = '<div class="shop-tabs">' + [['items', '道具'], ['upgrades', '牌型与役升级']].map(([id, label]) =>
+    const tabs = '<div class="shop-tabs">' + [['items', '道具'], ['upgrades', '牌型升级'], ['deck', '删牌']].map(([id, label]) =>
       button(label, 'shop-tab', { type: shopTab === id ? '' : 'quiet',
         aria: 'data-option="' + id + '" aria-pressed="' + (shopTab === id) + '"' })).join('') + '</div>';
     let products;
@@ -1265,6 +1336,8 @@ const Art = (() => {
       }).join('') + '</div>' : '<p>这批道具已售完。</p>';
       products += '<div class="shop-refresh">' + button(shop.refreshed ? '已刷新' : '刷新 · ' + REFRESH_PRICE + ' 金',
         'refresh-shop', { type: 'quiet', disabled: !game.canRefresh }) + '</div>';
+    } else if (shopTab === 'deck') {
+      products = deckHTML();
     } else {
       const level = levels[upgradeId] ?? 0;
       const price = game.upgradePrice(upgradeId);
@@ -1281,13 +1354,44 @@ const Art = (() => {
       tabs + products + '<div class="modal-actions">' + button('下一关', 'next-floor', { type: 'primary', glyph: 'arrow' }) + '</div>';
   }
 
+  const deckVariant = id => M.kind(id) * 2 + Number(M.isRed(id));
+  function deckHTML() {
+    const cards = game.cards;
+    const stacks = new Map();
+    for (const id of cards) {
+      const key = deckVariant(id);
+      if (!stacks.has(key)) stacks.set(key, []);
+      stacks.get(key).push(id);
+    }
+    const cost = removeIds.length * REMOVE_PRICE;
+    const canRemove = game.canRemove(removeIds);
+    const message = !game.removalsLeft ? '本次进店的删牌次数已用完。' :
+      game.s.coins < Math.max(REMOVE_PRICE, cost) ? '金币不足。' :
+      !removeIds.length ? '点选要移出的牌，同种牌可选多张。' :
+      canRemove ? '确认后，后续发牌和补牌都使用新牌库。' : '删掉所选牌后无法正常发牌或和牌。';
+    return '<p>牌库 ' + cards.length + ' 张 · 本店还可删 ' + game.removalsLeft + ' 张 · 每张 ' + REMOVE_PRICE + ' 金</p>' +
+      '<div class="deck-grid">' + [...stacks.values()].map(ids => {
+        const chosen = ids.filter(id => removeIds.includes(id)).length;
+        const next = ids.find(id => !removeIds.includes(id));
+        return '<button type="button" class="deck-card" data-action="select-remove" data-tile="' + next +
+          '" aria-label="' + M.tileName(ids[0]) + '，剩余 ' + ids.length + ' 张" aria-pressed="' + Boolean(chosen) + '"' +
+          (next === undefined || removeIds.length >= game.removalsLeft ? ' disabled' : '') +
+          '>' + tile(ids[0]) + '<span>×' + ids.length + (chosen ? ' · −' + chosen : '') + '</span></button>';
+      }).join('') + '</div>' +
+      (removeIds.length ? '<div class="removal-picks">' + removeIds.map(id =>
+        button(M.tileName(id) + ' ×', 'undo-remove', { type: 'quiet', aria: 'data-tile="' + id +
+          '" aria-label="取消选择' + M.tileName(id) + '"' })).join('') + '</div>' : '') +
+      '<div class="shop-product"><small role="status">' + message + '</small>' +
+      button('删 ' + removeIds.length + ' 张 · ' + cost + ' 金', 'remove-tile', { disabled: !canRemove }) + '</div>';
+  }
+
   function buildHTML() {
     const { items, relics, levels } = game.s;
     const owned = [
       ...[...new Set(items)].map(id => [itemById.get(id), items.filter(other => other === id).length]),
       ...[...new Set(relics)].map(id => [relicById.get(id), relics.filter(other => other === id).length])
     ];
-    return heading('本轮构筑') + '<p>每关可补 ' + game.maxDraws + ' 张 · 余额 ' + game.s.coins + ' 金</p>' +
+    return heading('本轮构筑') + '<p>每关可补 ' + game.maxDraws + ' 张 · 牌库 ' + game.cards.length + ' 张 · 余额 ' + game.s.coins + ' 金</p>' +
       Object.entries(levels).map(([id, value]) => '<div class="build-row"><b>' + upgradeById.get(id).name +
         '</b><small>+' + value + ' 翻</small></div>').join('') +
       owned.map(([item, count]) => '<div class="build-row"><b>' + item.name + (count > 1 ? ' ×' + count : '') +
@@ -1297,7 +1401,7 @@ const Art = (() => {
   const rules = heading('玩法') + '<ul><li>每关发 ' + POOL_SIZE + ' 张候选牌。点牌选入，点已选牌退回。最多选 ' +
     HAND_SIZE + ' 张，默认可补两张候选牌。</li><li>四面子一雀头、七对子或国士无双都能和牌。单手分数达到目标即可过关。</li>' +
     '<li>按东场南家门前自摸计分。系统选得分最高的和牌张，基本点为符 × 2<sup>翻+2</sup>，点数无上限。</li>' +
-    '<li>重发扣 1 命。每次过关赚 5–7 金，进入商店，离开时回复 1 命。先加翻，再乘总翻数。例如 5 翻加 2 翻后 ×2，结算 14 翻。</li></ul>' +
+    '<li>重发扣 1 命。每次过关赚 5–7 金，进入商店。每次进店最多删 3 张牌，每张 3 金。离开商店时回复 1 命。先加翻，再乘总翻数。例如 5 翻加 2 翻后 ×2，结算 14 翻。</li></ul>' +
     '<div class="modal-actions">' + button('重新挑战', 'restart', { glyph: 'restart' }) + '</div>';
 
   function renderModal() {
@@ -1388,7 +1492,12 @@ const Art = (() => {
         }
         break;
       case 'submit':
-        if (game.submit()) { shopTab = 'items'; move(); }
+        if (game.submit()) { shopTab = 'items'; removeIds = []; move(); }
+        break;
+      case 'select-remove': removeIds.push(Number(el.dataset.tile)); renderModal(); break;
+      case 'undo-remove': removeIds = removeIds.filter(id => id !== Number(el.dataset.tile)); renderModal(); break;
+      case 'remove-tile':
+        if (game.removeTiles(removeIds)) { removeIds = []; move(); }
         break;
       case 'shop-tab': shopTab = el.dataset.option; renderModal(); break;
       case 'buy': if (game.buy(el.dataset.option)) move(); break;
